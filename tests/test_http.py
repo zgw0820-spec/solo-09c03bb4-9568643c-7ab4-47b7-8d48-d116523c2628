@@ -132,3 +132,79 @@ def test_replica_endpoints_graceful_without_docker(client, monkeypatch):
     assert client.get("/api/replicas").status_code == 503
     assert client.post("/api/replicas/A/pause").status_code == 503
     assert client.post("/api/replicas/ZZ/pause").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# active-series limit over HTTP
+# --------------------------------------------------------------------------- #
+def set_limit(client, cluster, value):
+    return client.put(
+        f"/api/clusters/{cluster}/limit", json={"max_series": value}
+    )
+
+
+def test_limit_endpoint_roundtrip_and_unset_default(client):
+    assert set_limit(client, "demo", 5).json()["series_limit"] == 5
+    limits = client.get("/api/limits").json()
+    assert limits["lease_ms"] == 30_000
+    # A limit can be configured before the cluster has any data.
+    assert limits["clusters"][0]["cluster"] == "demo"
+    assert limits["clusters"][0]["series_limit"] == 5
+    post(client, "demo", "A", [(0, 1.0)])
+    limits = client.get("/api/limits").json()
+    assert limits["clusters"][0]["series_limit"] == 5
+    assert limits["clusters"][0]["active_series"] == 1
+    assert set_limit(client, "demo", None).json()["series_limit"] is None
+    assert client.get("/api/limits").json()["clusters"][0]["series_limit"] is None
+    assert set_limit(client, "demo", -1).status_code == 400
+    assert set_limit(client, "demo", 1.5).status_code == 422
+
+
+def test_limit_headers_and_dropped_count(client):
+    set_limit(client, "demo", 1)
+    first = post(client, "demo", "A", [(0, 1.0)])
+    assert first.headers["x-ingest-active-series"] == "1"
+    assert first.headers["x-ingest-limit-dropped"] == "0"
+
+    import time
+    now = int(time.time() * 1000)
+    payload = body([
+        series("demo", "A", [(now - BASE_TS, 2.0)]),
+        series("demo", "A", [(now - BASE_TS, 3.0)], name="other_metric"),
+    ])
+    resp = client.post("/api/v1/write", content=payload, headers=RW_HEADERS)
+    assert resp.status_code == 204
+    # The first series already holds the slot, the second one is dropped.
+    assert resp.headers["x-ingest-limit-dropped"] == "1"
+    rows = client.get("/api/series").json()["series"]
+    assert {row["name"] for row in rows} == {"demo_requests_total"}
+    cluster = client.get("/api/status").json()["clusters"][0]
+    assert cluster["series_limit"] == 1
+    assert cluster["active_series"] == 1
+    assert cluster["limit_dropped_total"] == 1
+
+
+def test_demo_batch_endpoint_injects_mixed_batch(client):
+    set_limit(client, "demo", 2)
+    first = client.post(
+        "/api/demo/batch", json={"existing_series": 0, "new_series": 2}
+    )
+    assert first.status_code == 200
+    assert first.json()["outcome"]["samples_stored"] == 2
+
+    second = client.post(
+        "/api/demo/batch", json={"existing_series": 2, "new_series": 3}
+    ).json()
+    assert second["existing_included"] == 2
+    # 2 live holders pass, the remaining 3 newcomers miss every free slot
+    assert second["outcome"]["samples_stored"] == 2
+    assert second["outcome"]["samples_limit_dropped"] == 3
+    assert second["outcome"]["active_series"] == 2
+    assert second["series_limit"] == 2
+    limits = client.get("/api/limits").json()["clusters"][0]
+    assert limits["limit_dropped_total"] == 3
+
+
+def test_index_page_exposes_limit_controls(client):
+    assert "活跃序列上限" in client.get("/").text
+    assert "demo/batch" in client.get("/").text

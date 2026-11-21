@@ -24,6 +24,10 @@ DB_PATH = _env("DB_PATH", "/data/receiver.db")
 # considered stale and may be replaced by another replica carrying new points.
 STALE_AFTER_SECONDS = _env_float("STALE_AFTER_SECONDS", 10.0)
 
+# How long a series keeps its active-series slot after its last successful
+# new-point write (each successful new point restarts the window).
+LEASE_SECONDS = _env_float("LEASE_SECONDS", 30.0)
+
 # Require Prometheus remote-write 1.0 protocol markers on requests.
 REQUIRE_REMOTE_WRITE_HEADER = _env("REQUIRE_REMOTE_WRITE_HEADER", "1") == "1"
 

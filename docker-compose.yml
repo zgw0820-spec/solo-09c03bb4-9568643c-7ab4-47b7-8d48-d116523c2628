@@ -6,6 +6,9 @@ services:
     environment:
       DB_PATH: /data/receiver.db
       STALE_AFTER_SECONDS: "10"
+      # Each active series keeps its slot for this long after the last
+      # successfully stored new point.
+      LEASE_SECONDS: "30"
       DOCKER_BASE_URL: unix:///var/run/docker.sock
       REPLICA_CONTAINERS: "A=rw-demo-prom-a,B=rw-demo-prom-b"
     ports:

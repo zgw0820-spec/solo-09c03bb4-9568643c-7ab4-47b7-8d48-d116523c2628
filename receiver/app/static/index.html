@@ -55,6 +55,22 @@
   }
   code { color: var(--amber); }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .limit-input {
+    width: 74px; background: #0c111d; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px;
+  }
+  .inline-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .inline-form button { padding: 4px 9px; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .form-grid input, .form-grid select {
+    background: #0c111d; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px;
+  }
+  pre.result {
+    margin: 10px 0 0; padding: 10px; background: #0c111d; border-radius: 8px;
+    font-size: 12px; overflow: auto; max-height: 180px;
+  }
 </style>
 </head>
 <body>
@@ -62,16 +78,25 @@
 <div class="sub">
   按 <code>cluster</code> 选择当前供数副本，剥除 <code>replica</code> 标签后逐序列入库；
   仅接收晚于尾点的样本，重发不续期。停报 <b id="staleSecs">10</b> 秒且另一副本带新点时发生接替。
+  活跃序列上限按 cluster 设置：每条序列自最后一次成功写入新点起占用名额 <b id="leaseSecs">30</b> 秒，
+  占额序列继续收数，其余序列仅在有空位时写入，否则丢弃新点。
 </div>
 
 <div class="grid">
   <div class="panel">
-    <h2>集群状态 / 当前来源</h2>
+    <h2>集群状态 / 当前来源 / 活跃序列上限</h2>
     <table id="clusterTable">
-      <thead><tr><th>cluster</th><th>当前副本</th><th>新鲜度</th><th>最近新点</th></tr></thead>
+      <thead><tr><th>cluster</th><th>当前副本</th><th>新鲜度</th><th>最近新点</th><th>活跃 / 上限</th><th>限额丢弃</th><th>上限设置</th></tr></thead>
       <tbody></tbody>
     </table>
     <p class="muted" id="clusterEmpty" style="margin-top:10px">尚无数据，等待 Remote Write 写入…</p>
+    <div class="inline-form" style="margin-top:12px">
+      <span class="muted">为任意 cluster 预设上限：</span>
+      <input class="limit-input" id="presetCluster" placeholder="cluster" />
+      <input class="limit-input" id="presetLimit" type="number" min="0" placeholder="上限" />
+      <button onclick="presetLimit()">设置</button>
+      <button onclick="presetLimit(true)">取消上限</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -92,6 +117,32 @@
       <div class="stat"><div class="muted">样本总数</div><div class="big" id="sampleCount">0</div></div>
       <div class="stat"><div class="muted">切换事件</div><div class="big" id="eventCount">0</div></div>
     </div>
+  </div>
+
+  <div class="panel" style="grid-column: 1 / -1;">
+    <h2>本地混合批次演示（不依赖 Docker）</h2>
+    <div class="form-grid">
+      <label>cluster
+        <select id="demoCluster"><option value="demo">demo</option></select>
+      </label>
+      <label>replica
+        <select id="demoReplica"><option>A</option><option>B</option></select>
+      </label>
+      <label>已有序列数（应继续收数）
+        <input id="demoExisting" type="number" min="0" value="3" />
+      </label>
+      <label>新序列数（争抢空位）
+        <input id="demoNew" type="number" min="0" value="3" />
+      </label>
+      <label>&nbsp;
+        <button onclick="runDemoBatch()">注入一个混合批次</button>
+      </label>
+    </div>
+    <p class="muted" style="margin:0">
+      一次请求内同时包含已占额序列与新序列：已占额序列照常写新点，新序列只在有空位时写入，
+      满额即丢弃新点（结果中看 <code>samples_limit_dropped</code>）。所有已提交写入都会刷新相应序列的 30 秒占额。
+    </p>
+    <pre class="result" id="demoResult">尚未注入批次</pre>
   </div>
 
   <div class="panel" style="grid-column: 1 / -1;">
@@ -136,20 +187,117 @@ async function api(path, options) {
 async function refreshStatus() {
   const data = await api('/api/status');
   document.getElementById('staleSecs').textContent = (data.stale_after_ms / 1000).toFixed(0);
+  document.getElementById('leaseSecs').textContent = (data.lease_ms / 1000).toFixed(0);
   const tbody = document.querySelector('#clusterTable tbody');
+  const previous = new Set([...document.querySelectorAll('#demoCluster option')].map(o => o.value));
   tbody.innerHTML = '';
   const clusters = data.clusters || [];
   document.getElementById('clusterEmpty').style.display = clusters.length ? 'none' : 'block';
+  const clusterSelect = document.getElementById('demoCluster');
   for (const c of clusters) {
     const tr = document.createElement('tr');
     const badge = c.stale
       ? '<span class="badge stale">已停报/陈旧</span>'
       : '<span class="badge fresh"><span class="dot" style="background:var(--green)"></span>供数中</span>';
+    const limit = c.series_limit == null ? '不限' : c.series_limit;
+    const occupancy = `${c.active_series} / ${limit}`;
     tr.innerHTML = `<td><code>${c.cluster}</code></td>
       <td><b>${c.active_replica ?? '—'}</b></td>
       <td>${badge}</td>
-      <td class="muted">${fmt(c.last_write_ms)}</td>`;
+      <td class="muted">${fmt(c.last_write_ms)}</td>
+      <td><b>${occupancy}</b></td>
+      <td class="muted">${c.limit_dropped_total ?? 0}</td>
+      <td></td>`;
+    const form = document.createElement('div');
+    form.className = 'inline-form';
+    form.innerHTML = `<input class="limit-input" type="number" min="0"
+        value="${c.series_limit == null ? '' : c.series_limit}" placeholder="不限">
+      <button>保存</button>
+      <button>取消上限</button>`;
+    const [input, saveBtn, clearBtn] = form.querySelectorAll('input, button');
+    const apply = async value => {
+      try {
+        await api(`/api/clusters/${encodeURIComponent(c.cluster)}/limit`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({max_series: value}),
+        });
+        toast(`${c.cluster} 上限已设为 ${value == null ? '不限' : value}`);
+        refreshStatus();
+      } catch (err) {
+        toast(err.message, true);
+      }
+    };
+    saveBtn.onclick = () => {
+      const raw = input.value.trim();
+      if (raw === '') return apply(null);
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < 0) return toast('上限须为非负整数', true);
+      apply(value);
+    };
+    clearBtn.onclick = () => apply(null);
+    tr.lastElementChild.appendChild(form);
     tbody.appendChild(tr);
+    if (!previous.has(c.cluster)) {
+      const opt = document.createElement('option');
+      opt.value = c.cluster;
+      opt.textContent = c.cluster;
+      clusterSelect.appendChild(opt);
+    }
+  }
+}
+
+async function presetLimit(clear) {
+  const cluster = document.getElementById('presetCluster').value.trim();
+  if (!cluster) return toast('请填写 cluster', true);
+  const raw = document.getElementById('presetLimit').value.trim();
+  const value = clear ? null : Number(raw);
+  if (!clear && (raw === '' || !Number.isInteger(value) || value < 0)) {
+    return toast('上限须为非负整数', true);
+  }
+  try {
+    await api(`/api/clusters/${encodeURIComponent(cluster)}/limit`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({max_series: value}),
+    });
+    toast(`${cluster} 上限已${clear ? '取消' : '设为 ' + value}`);
+    refreshStatus();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function runDemoBatch() {
+  const body = {
+    cluster: document.getElementById('demoCluster').value || 'demo',
+    replica: document.getElementById('demoReplica').value || 'A',
+    existing_series: Number(document.getElementById('demoExisting').value || 0),
+    new_series: Number(document.getElementById('demoNew').value || 0),
+  };
+  try {
+    const data = await api('/api/demo/batch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const o = data.outcome;
+    document.getElementById('demoResult').textContent = JSON.stringify({
+      cluster: data.cluster,
+      replica: data.replica,
+      series_limit: data.series_limit,
+      role: o.role,
+      existing_included: data.existing_included,
+      samples_received: o.samples_received,
+      samples_stored: o.samples_stored,
+      samples_limit_dropped: o.samples_limit_dropped,
+      active_series: o.active_series,
+      reason: o.reason,
+    }, null, 2);
+    toast(`批次已写入：stored=${o.samples_stored} dropped=${o.samples_limit_dropped}`);
+    tick();
+  } catch (err) {
+    toast(err.message, true);
   }
 }
 
@@ -251,9 +399,13 @@ async function refreshEvents() {
   tbody.innerHTML = '';
   for (const e of data.events) {
     const tr = document.createElement('tr');
-    const type = e.event_type === 'TAKEOVER'
-      ? '<span class="badge stale">接替</span>'
-      : '<span class="badge fresh">首次选择</span>';
+    const typeLabel = e.event_type === 'TAKEOVER' ? '接替'
+      : e.event_type === 'LIMIT_SCHEMA_UPGRADE' ? '升级启用上限'
+      : '首次选择';
+    const typeClass = e.event_type === 'TAKEOVER' ? 'stale'
+      : e.event_type === 'LIMIT_SCHEMA_UPGRADE' ? 'running'
+      : 'fresh';
+    const type = `<span class="badge ${typeClass}">${typeLabel}</span>`;
     tr.innerHTML = `<td class="muted">${fmt(e.ts_ms)}</td><td><code>${e.cluster}</code></td>
       <td>${type}</td><td>${e.old_replica ?? '—'}</td><td><b>${e.new_replica ?? '—'}</b></td>
       <td class="muted">${e.reason ?? ''}</td>`;
